@@ -1,0 +1,217 @@
+/*
+ * depkb exporter — Gradle init script.
+ *
+ * Adds a `depKbExport` task to every project. It writes the RESOLVED dependency
+ * graph (what Gradle actually picked, and why) for selected configurations to
+ * JSON, without compiling anything. depkb.py ingests the JSON into SQLite.
+ *
+ * Usage (normally run for you by `depkb.py build`):
+ *   ./gradlew -I depkb.init.gradle depKbExport -Ddepkb.out=/abs/dir --continue
+ *
+ * System properties:
+ *   depkb.out      output directory (required, absolute)
+ *   depkb.configs  comma list of configurations, or "all" for every resolvable one
+ *                  default: compileClasspath,runtimeClasspath,testCompileClasspath,
+ *                           testRuntimeClasspath,annotationProcessor
+ *
+ * Compatible with the configuration cache: everything is captured as providers at
+ * configuration time; the task action never touches `project`.
+ */
+
+import groovy.json.JsonOutput
+import org.gradle.api.artifacts.component.ModuleComponentIdentifier
+import org.gradle.api.artifacts.component.ProjectComponentIdentifier
+import org.gradle.api.artifacts.result.ResolvedArtifactResult
+import org.gradle.api.artifacts.result.ResolvedComponentResult
+import org.gradle.api.artifacts.result.ResolvedDependencyResult
+import org.gradle.api.artifacts.result.UnresolvedDependencyResult
+
+abstract class DepKbExportTask extends DefaultTask {
+    @Internal Map<String, Provider<ResolvedComponentResult>> graphs = [:]
+    @Internal Map<String, Provider<List<String>>> artifacts = [:]   // "group:name:version\tfile"
+    @Internal Map<String, String> setupErrors = [:]
+    @Internal String projectPath
+    @Internal String projectName
+    @Internal String projectDirPath
+    @Internal String outFilePath
+    @Internal String projectKind = 'none'                 // app | lib | none
+    @Internal List<Map<String, Object>> sourceSetInfo = []  // [name, dirs, classes, cp]
+    @Internal List<Map<String, Object>> declaredDeps = []   // what the build files declare, per bucket
+    @Internal boolean javaLibrary = false
+    @Internal Map<String, Object> javaInfo = [:]            // release / toolchain / target, Gradle + its JVM
+
+    static String cid(def id) {
+        if (id instanceof ProjectComponentIdentifier) return "project " + id.projectPath
+        if (id instanceof ModuleComponentIdentifier) return "${id.group}:${id.module}:${id.version}"
+        return id.displayName
+    }
+
+    static List reasons(ResolvedComponentResult c) {
+        def out = []
+        c.selectionReason.descriptions.each { d ->
+            def s = d.description
+            def cause = d.cause.name()
+            // "requested" alone is noise — it is the default for every node
+            if (cause == 'REQUESTED' && (s == null || s == 'requested')) return
+            def r = (s && s != cause.toLowerCase().replace('_', ' ')) ? "${cause.toLowerCase().replace('_', ' ')}: ${s}" : cause.toLowerCase().replace('_', ' ')
+            if (!out.contains(r)) out << r
+        }
+        return out
+    }
+
+    @TaskAction
+    void export() {
+        def result = [project: projectPath, name: projectName, dir: projectDirPath, kind: projectKind,
+                      javaLibrary: javaLibrary, java: javaInfo, sourceSets: sourceSetInfo, declared: declaredDeps,
+                      configs: [:]]
+        setupErrors.each { cfg, err -> result.configs[cfg] = [error: err] }
+
+        graphs.each { cfgName, graphProvider ->
+            try {
+                ResolvedComponentResult root = graphProvider.get()
+                def comps = [:]          // id -> [k, r]
+                def edges = []
+                def unresolved = []
+                def queue = new ArrayDeque<ResolvedComponentResult>()
+                def visited = new HashSet<String>()
+                String rootId = cid(root.id)
+                queue.add(root); visited.add(rootId)
+                while (!queue.isEmpty()) {
+                    def c = queue.poll()
+                    String from = cid(c.id)
+                    if (c != root) {
+                        comps[from] = [k: (c.id instanceof ProjectComponentIdentifier) ? 'p' : 'm', r: reasons(c)]
+                    }
+                    c.dependencies.each { d ->
+                        if (d instanceof ResolvedDependencyResult) {
+                            def sel = d.selected
+                            String to = cid(sel.id)
+                            def e = [f: from, t: to, q: d.requested.displayName]
+                            if (d.constraint) e.c = 1
+                            edges << e
+                            if (visited.add(to)) queue.add(sel)
+                        } else if (d instanceof UnresolvedDependencyResult) {
+                            def msg = d.failure?.message ?: 'unresolved'
+                            unresolved << [f: from, q: d.requested.displayName,
+                                           e: msg.length() > 300 ? msg.substring(0, 300) : msg]
+                        }
+                    }
+                }
+                def arts = []
+                def ap = artifacts[cfgName]
+                if (ap != null) {
+                    try {
+                        ap.get().each { String line ->
+                            def i = line.indexOf('\t')
+                            arts << [id: line.substring(0, i), file: line.substring(i + 1)]
+                        }
+                    } catch (Exception ex) {
+                        // artifacts are best effort; graph data is still useful
+                    }
+                }
+                result.configs[cfgName] = [root: rootId, components: comps, edges: edges,
+                                           unresolved: unresolved, artifacts: arts]
+            } catch (Exception ex) {
+                result.configs[cfgName] = [error: (ex.message ?: ex.class.name).take(500)]
+            }
+        }
+        def f = new File(outFilePath)
+        f.parentFile.mkdirs()
+        f.text = JsonOutput.toJson(result)
+    }
+}
+
+def depkbOut = System.getProperty('depkb.out')
+def depkbConfigsProp = (System.getProperty('depkb.configs') ?:
+        'compileClasspath,runtimeClasspath,testCompileClasspath,testRuntimeClasspath,annotationProcessor').trim()
+
+allprojects { Project p ->
+    p.tasks.register('depKbExport', DepKbExportTask) { DepKbExportTask t ->
+        t.group = 'help'
+        t.description = 'Exports the resolved dependency graph for depkb.'
+        t.outputs.upToDateWhen { false }
+        if (!depkbOut) throw new GradleException("depKbExport needs -Ddepkb.out=<absolute dir>")
+        t.projectPath = p.path
+        t.projectName = p.name
+        t.projectDirPath = p.projectDir.absolutePath
+        def safe = p.path == ':' ? '_root' : p.path.substring(1).replace(':', '__')
+        t.outFilePath = new File(new File(depkbOut, 'projects'), safe + '.json').absolutePath
+
+        // What kind of module is this? "app" = something that is deployed/run, so its
+        // runtimeClasspath is what really executes.
+        def appPlugins = ['application', 'war', 'org.springframework.boot', 'io.quarkus',
+                          'io.micronaut.application', 'com.gradleup.shadow', 'com.github.johnrengelman.shadow']
+        t.projectKind = appPlugins.any { p.pluginManager.hasPlugin(it) } ? 'app'
+                : (p.pluginManager.hasPlugin('java') ? 'lib' : 'none')
+
+        // Real source directories per source set (custom layouts, integrationTest, ...)
+        def extraConfigs = []
+        def sets = p.extensions.findByName('sourceSets')
+        if (sets != null) {
+            sets.each { ss ->
+                def dirs = ss.allSource.srcDirs*.absolutePath.sort()
+                def classes = ss.output.classesDirs.files*.absolutePath.sort()
+                t.sourceSetInfo << [name: ss.name, dirs: dirs, classes: classes, cp: ss.compileClasspathConfigurationName]
+                extraConfigs << ss.compileClasspathConfigurationName
+            }
+        }
+
+        t.javaLibrary = p.pluginManager.hasPlugin('java-library')
+        // Which Java a module compiles for, and which JVM runs Gradle
+        t.javaInfo.gradle = p.gradle.gradleVersion
+        t.javaInfo.gradleJvm = System.getProperty('java.version')
+        def javaExt = p.extensions.findByName('java')
+        if (javaExt != null) {
+            try { t.javaInfo.target = javaExt.targetCompatibility?.majorVersion } catch (Exception ignored) {}
+            try {
+                def lv = javaExt.toolchain.languageVersion
+                if (lv.isPresent()) t.javaInfo.toolchain = lv.get().asInt()
+            } catch (Exception ignored) {}
+        }
+        def cj = p.tasks.findByName('compileJava')
+        if (cj != null) {
+            try {
+                def rel = cj.options.release
+                if (rel.isPresent()) t.javaInfo.release = rel.get()
+            } catch (Exception ignored) {}
+        }
+        // Declared dependencies per bucket (api, implementation, runtimeOnly, testImplementation, ...)
+        p.configurations.each { c ->
+            if (c.canBeResolved || c.canBeConsumed) return
+            c.dependencies.each { d ->
+                if (d instanceof ProjectDependency) {
+                    def path = d.metaClass.respondsTo(d, 'getPath') ? d.getPath() : d.dependencyProject.path
+                    t.declaredDeps << [b: c.name, id: "project " + path]
+                } else if (d instanceof ExternalModuleDependency) {
+                    def cat = d.attributes.getAttribute(Category.CATEGORY_ATTRIBUTE)
+                    def e = [b: c.name, id: "${d.group}:${d.name}".toString(), v: d.version ?: '']
+                    if (cat != null && cat.name in ['platform', 'enforced-platform']) e.platform = 1
+                    t.declaredDeps << e
+                }
+            }
+        }
+
+        def wanted = depkbConfigsProp == 'all'
+                ? p.configurations.findAll { it.canBeResolved }*.name
+                : (depkbConfigsProp.split(',')*.trim().findAll { it } + extraConfigs).unique()
+        wanted.each { String name ->
+            def cfg = p.configurations.findByName(name)
+            if (cfg == null || !cfg.canBeResolved) return
+            try {
+                t.graphs[name] = cfg.incoming.resolutionResult.rootComponent
+                // Only external modules: never triggers building sibling projects' jars.
+                t.artifacts[name] = cfg.incoming.artifactView {
+                    it.lenient(true)
+                    it.componentFilter { id -> id instanceof ModuleComponentIdentifier }
+                }.artifacts.resolvedArtifacts.map { Set<ResolvedArtifactResult> set ->
+                    set.findAll { it.id.componentIdentifier instanceof ModuleComponentIdentifier }.collect {
+                        def id = (ModuleComponentIdentifier) it.id.componentIdentifier
+                        "${id.group}:${id.module}:${id.version}\t${it.file.absolutePath}".toString()
+                    }
+                }
+            } catch (Exception ex) {
+                t.setupErrors[name] = (ex.message ?: ex.class.name).take(500)
+            }
+        }
+    }
+}
